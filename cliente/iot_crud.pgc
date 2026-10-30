@@ -1,0 +1,645 @@
+/*
+ * =====================================================================
+ * TAREA 10 · Programacion del lado del cliente: SQL embebido con C
+ * IoT Analytics Dashboard (NexoDev Solutions)
+ *
+ * Programa en C con SQL embebido (ECPG, precompilador de PostgreSQL).
+ * Las sentencias EXEC SQL se escriben dentro del codigo C; el comando
+ * "ecpg" las traduce a llamadas de la biblioteca libecpg antes de compilar.
+ *
+ * Operaciones CRUD sobre los datos de los sensores IoT:
+ *   C  crear-sensor, registrar, simular
+ *   R  listar, sensor, lecturas, resumen, monitor
+ *   U  umbral, estado
+ *   D  eliminar-lectura, eliminar-sensor
+ *   +  benchmark (analisis de rendimiento)
+ * =====================================================================
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+EXEC SQL INCLUDE sqlca;          /* area de comunicacion: codigo y mensaje de cada sentencia */
+
+/* ------------------------------------------------------------------ */
+/* Manejo de errores                                                   */
+/* ------------------------------------------------------------------ */
+static int hubo_error = 0;
+
+/* Se llama automaticamente despues de cualquier sentencia que falle */
+static void manejar_error(void)
+{
+    hubo_error = 1;
+    fprintf(stderr, "\n[ERROR SQL] SQLSTATE %.5s (codigo %ld)\n  %.*s\n",
+            sqlca.sqlstate, sqlca.sqlcode,
+            sqlca.sqlerrm.sqlerrml, sqlca.sqlerrm.sqlerrmc);
+}
+
+/* Explica en lenguaje claro los SQLSTATE mas comunes */
+static const char *explicar(const char *estado)
+{
+    if (strncmp(estado, "23505", 5) == 0) return "ya existe un registro con ese codigo";
+    if (strncmp(estado, "23503", 5) == 0) return "el registro tiene datos que dependen de el";
+    if (strncmp(estado, "23514", 5) == 0) return "el valor no cumple una regla (CHECK) de la tabla";
+    if (strncmp(estado, "22P02", 5) == 0) return "el formato del dato no es valido";
+    if (strncmp(estado, "08", 2) == 0)    return "problema de conexion con el servidor";
+    return "revisa el mensaje del servidor";
+}
+
+/* Revisa el resultado de la ultima sentencia: si fallo, deshace la transaccion */
+static int fallo(const char *operacion)
+{
+    if (sqlca.sqlcode < 0) {
+        char estado[6];
+        memcpy(estado, sqlca.sqlstate, 5); estado[5] = '\0';
+        fprintf(stderr, "No se pudo %s: %s. Se deshizo la transaccion (ROLLBACK).\n",
+                operacion, explicar(estado));
+        EXEC SQL ROLLBACK;
+        return 1;
+    }
+    return 0;
+}
+
+EXEC SQL WHENEVER SQLERROR CALL manejar_error();
+
+/* ------------------------------------------------------------------ */
+/* Conexion                                                            */
+/* ------------------------------------------------------------------ */
+static const char *env(const char *nombre, const char *defecto)
+{
+    const char *v = getenv(nombre);
+    return (v && *v) ? v : defecto;
+}
+
+static int conectar(void)
+{
+    EXEC SQL BEGIN DECLARE SECTION;       /* variables de enlace (host variables) */
+    char destino[256];
+    char usuario[64];
+    char clave[64];
+    char ssl[16];
+    EXEC SQL END DECLARE SECTION;
+
+    snprintf(destino, sizeof destino, "tcp:postgresql://%s:%s/%s?sslmode=%s",
+             env("DB_HOST", "datos"), env("DB_PORT", "5432"),
+             env("DB_NAME", "iotanalytics"), env("DB_SSLMODE", "require"));
+    snprintf(usuario, sizeof usuario, "%s", env("DB_USER", "app_iot"));
+    snprintf(clave, sizeof clave, "%s", env("DB_PASSWORD", ""));
+
+    EXEC SQL CONNECT TO :destino AS iot USER :usuario USING :clave;
+    if (sqlca.sqlcode != 0) {
+        fprintf(stderr, "No se pudo conectar a %s\n", destino);
+        return -1;
+    }
+    EXEC SQL SELECT CASE WHEN ssl THEN 'SSL activo' ELSE 'sin SSL' END INTO :ssl
+             FROM pg_stat_ssl WHERE pid = pg_backend_pid();
+    EXEC SQL COMMIT;
+    if (getenv("IOT_SILENCIO") == NULL)
+        printf("Conectado a PostgreSQL como %s (%s)\n\n", usuario, ssl);
+    return 0;
+}
+
+/* ================================================================== */
+/* R · LEER                                                           */
+/* ================================================================== */
+
+/* listar: todos los sensores con su ultima lectura (cursor) */
+static int cmd_listar(void)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+    char codigo[21], tipo[21], unidad[11], disp[21], estado[16], hora[9];
+    double umbral, valor;
+    short ind_valor, ind_hora;            /* variables indicadoras: -1 = NULL */
+    EXEC SQL END DECLARE SECTION;
+    int n = 0;
+
+    EXEC SQL DECLARE cur_sensores CURSOR FOR
+        SELECT s.codigo, s.tipo, s.unidad, s.umbral_max, d.codigo, d.estado,
+               u.valor, to_char(u.medido_en, 'HH24:MI:SS')
+        FROM sensores s
+        JOIN dispositivos d ON d.id = s.dispositivo_id
+        LEFT JOIN LATERAL (SELECT l.valor, l.medido_en FROM lecturas l
+                           WHERE l.sensor_id = s.id
+                           ORDER BY l.medido_en DESC LIMIT 1) u ON TRUE
+        ORDER BY s.codigo;
+
+    EXEC SQL OPEN cur_sensores;
+    if (fallo("abrir el cursor")) return 1;
+
+    printf("%-11s %-12s %-7s %-14s %8s %8s  %-8s\n",
+           "SENSOR", "TIPO", "DISP.", "ESTADO", "UMBRAL", "ULTIMO", "HORA");
+    printf("-----------------------------------------------------------------------------\n");
+    for (;;) {
+        EXEC SQL FETCH cur_sensores INTO :codigo, :tipo, :unidad, :umbral, :disp, :estado,
+                                         :valor :ind_valor, :hora :ind_hora;
+        if (sqlca.sqlcode == ECPG_NOT_FOUND || sqlca.sqlcode < 0) break;
+        if (ind_valor < 0)
+            printf("%-11s %-12s %-7s %-14s %8.2f %8s  %-8s\n", codigo, tipo, disp, estado, umbral, "--", "--");
+        else
+            printf("%-11s %-12s %-7s %-14s %8.2f %8.2f  %-8s %s\n", codigo, tipo, disp, estado,
+                   umbral, valor, hora, valor > umbral ? "<- SOBRE UMBRAL" : "");
+        n++;
+    }
+    EXEC SQL CLOSE cur_sensores;
+    EXEC SQL COMMIT;
+    printf("\n%d sensores\n", n);
+    return 0;
+}
+
+/* sensor <codigo>: detalle de un sensor (SELECT ... INTO de una sola fila) */
+static int cmd_sensor(const char *cod)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+    char codigo[21], tipo[21], unidad[11], disp[21], nombre[61];
+    double umbral, prom, minimo, maximo;
+    long lecturas_hora, alertas;
+    short ind_prom, ind_min, ind_max;
+    EXEC SQL END DECLARE SECTION;
+
+    snprintf(codigo, sizeof codigo, "%s", cod);
+    EXEC SQL SELECT s.tipo, s.unidad, s.umbral_max, d.codigo, d.nombre,
+                    COUNT(l.id), AVG(l.valor), MIN(l.valor), MAX(l.valor),
+                    (SELECT COUNT(*) FROM alertas a WHERE a.sensor_id = s.id AND NOT a.atendida)
+             INTO :tipo, :unidad, :umbral, :disp, :nombre,
+                  :lecturas_hora, :prom :ind_prom, :minimo :ind_min, :maximo :ind_max, :alertas
+             FROM sensores s
+             JOIN dispositivos d ON d.id = s.dispositivo_id
+             LEFT JOIN lecturas l ON l.sensor_id = s.id AND l.medido_en > NOW() - INTERVAL '1 hour'
+             WHERE s.codigo = :codigo
+             GROUP BY s.id, s.tipo, s.unidad, s.umbral_max, d.codigo, d.nombre;
+    if (fallo("consultar el sensor")) return 1;
+    if (sqlca.sqlcode == ECPG_NOT_FOUND) {
+        printf("El sensor %s no existe.\n", codigo);
+        EXEC SQL COMMIT;
+        return 1;
+    }
+    EXEC SQL COMMIT;
+
+    printf("Sensor        : %s (%s, %s)\n", codigo, tipo, unidad);
+    printf("Dispositivo   : %s - %s\n", disp, nombre);
+    printf("Umbral maximo : %.2f %s\n", umbral, unidad);
+    printf("Ultima hora   : %ld lecturas\n", lecturas_hora);
+    if (ind_prom < 0)
+        printf("Promedio      : sin lecturas en la ultima hora (NULL)\n");
+    else
+        printf("Promedio      : %.2f   minimo %.2f   maximo %.2f\n", prom, minimo, maximo);
+    printf("Alertas pendientes: %ld\n", alertas);
+    return 0;
+}
+
+/* lecturas <sensor> [n]: ultimas n lecturas (cursor con parametros) */
+static int cmd_lecturas(const char *cod, int cuantas)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+    char codigo[21], hora[20], severidad[13];
+    long id;
+    double valor;
+    int limite;
+    short ind_sev;
+    EXEC SQL END DECLARE SECTION;
+    int n = 0;
+
+    snprintf(codigo, sizeof codigo, "%s", cod);
+    limite = cuantas > 0 ? cuantas : 10;
+
+    EXEC SQL DECLARE cur_lecturas CURSOR FOR
+        SELECT l.id, l.valor, to_char(l.medido_en, 'YYYY-MM-DD HH24:MI:SS'), a.severidad
+        FROM lecturas l
+        JOIN sensores s ON s.id = l.sensor_id
+        LEFT JOIN alertas a ON a.lectura_id = l.id
+        WHERE s.codigo = :codigo
+        ORDER BY l.medido_en DESC
+        LIMIT :limite;
+    EXEC SQL OPEN cur_lecturas;
+    if (fallo("abrir el cursor")) return 1;
+
+    printf("Ultimas %d lecturas de %s\n%-8s %10s  %-19s  %s\n", limite, codigo,
+           "ID", "VALOR", "FECHA", "ALERTA");
+    for (;;) {
+        EXEC SQL FETCH cur_lecturas INTO :id, :valor, :hora, :severidad :ind_sev;
+        if (sqlca.sqlcode == ECPG_NOT_FOUND || sqlca.sqlcode < 0) break;
+        printf("%-8ld %10.2f  %-19s  %s\n", id, valor, hora, ind_sev < 0 ? "-" : severidad);
+        n++;
+    }
+    EXEC SQL CLOSE cur_lecturas;
+    EXEC SQL COMMIT;
+    if (n == 0) printf("(sin lecturas: revisa el codigo del sensor)\n");
+    return 0;
+}
+
+/* resumen: indicadores generales y promedios por tipo (agregados) */
+static int cmd_resumen(void)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+    long total, ultimo_min, pendientes, criticas;
+    char tipo[21];
+    double prom;
+    long n;
+    EXEC SQL END DECLARE SECTION;
+
+    EXEC SQL SELECT (SELECT COUNT(*) FROM lecturas),
+                    (SELECT COUNT(*) FROM lecturas WHERE medido_en > NOW() - INTERVAL '1 minute'),
+                    COUNT(*) FILTER (WHERE NOT atendida),
+                    COUNT(*) FILTER (WHERE NOT atendida AND severidad = 'critica')
+             INTO :total, :ultimo_min, :pendientes, :criticas
+             FROM alertas;
+    if (fallo("calcular el resumen")) return 1;
+
+    printf("Lecturas totales      : %ld\n", total);
+    printf("Lecturas ultimo minuto: %ld\n", ultimo_min);
+    printf("Alertas pendientes    : %ld (%ld criticas)\n\n", pendientes, criticas);
+
+    EXEC SQL DECLARE cur_tipos CURSOR FOR
+        SELECT s.tipo, ROUND(AVG(l.valor), 2), COUNT(*)
+        FROM lecturas l JOIN sensores s ON s.id = l.sensor_id
+        WHERE l.medido_en > NOW() - INTERVAL '10 minutes'
+        GROUP BY s.tipo ORDER BY s.tipo;
+    EXEC SQL OPEN cur_tipos;
+    printf("Promedio de los ultimos 10 minutos por tipo:\n");
+    for (;;) {
+        EXEC SQL FETCH cur_tipos INTO :tipo, :prom, :n;
+        if (sqlca.sqlcode == ECPG_NOT_FOUND || sqlca.sqlcode < 0) break;
+        printf("  %-12s %8.2f  (%ld lecturas)\n", tipo, prom, n);
+    }
+    EXEC SQL CLOSE cur_tipos;
+    EXEC SQL COMMIT;
+    return 0;
+}
+
+/* monitor [segundos]: resumen que se actualiza cada 2 s (tiempo real) */
+static int cmd_monitor(int segundos)
+{
+    time_t fin = time(NULL) + (segundos > 0 ? segundos : 30);
+    while (time(NULL) < fin) {
+        printf("\033[H\033[J== IoT Analytics Dashboard · monitor en C (Ctrl+C para salir) ==\n\n");
+        if (cmd_resumen() != 0) return 1;
+        fflush(stdout);
+        sleep(2);
+    }
+    return 0;
+}
+
+/* ================================================================== */
+/* C · CREAR                                                          */
+/* ================================================================== */
+
+/* crear-sensor <codigo> <dispositivo> <tipo> <unidad> <umbral> */
+static int cmd_crear_sensor(char **a)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+    char codigo[21], disp[21], tipo[21], unidad[11];
+    double umbral;
+    int id;
+    EXEC SQL END DECLARE SECTION;
+
+    snprintf(codigo, sizeof codigo, "%s", a[0]);
+    snprintf(disp, sizeof disp, "%s", a[1]);
+    snprintf(tipo, sizeof tipo, "%s", a[2]);
+    snprintf(unidad, sizeof unidad, "%s", a[3]);
+    umbral = atof(a[4]);
+
+    EXEC SQL INSERT INTO sensores (dispositivo_id, codigo, tipo, unidad, umbral_max)
+             SELECT d.id, :codigo, :tipo, :unidad, :umbral
+             FROM dispositivos d WHERE d.codigo = :disp
+             RETURNING id INTO :id;
+    if (fallo("crear el sensor")) return 1;
+    if (sqlca.sqlcode == ECPG_NOT_FOUND) {
+        printf("El dispositivo %s no existe; no se creo el sensor.\n", disp);
+        EXEC SQL ROLLBACK;
+        return 1;
+    }
+    EXEC SQL COMMIT;
+    printf("Sensor %s creado con id %d en %s (umbral %.2f %s).\n", codigo, id, disp, umbral, unidad);
+    return 0;
+}
+
+/* registrar <sensor> <valor>: inserta una lectura y muestra si genero alerta */
+static int cmd_registrar(const char *cod, double v)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+    char codigo[21], severidad[13];
+    double valor;
+    long id;
+    short ind_sev;
+    EXEC SQL END DECLARE SECTION;
+
+    snprintf(codigo, sizeof codigo, "%s", cod);
+    valor = v;
+    EXEC SQL INSERT INTO lecturas (sensor_id, valor)
+             SELECT id, :valor FROM sensores WHERE codigo = :codigo
+             RETURNING id INTO :id;
+    if (fallo("registrar la lectura")) return 1;
+    if (sqlca.sqlcode == ECPG_NOT_FOUND) {
+        printf("El sensor %s no existe.\n", codigo);
+        EXEC SQL ROLLBACK;
+        return 1;
+    }
+    /* la alerta la crea el disparador de la base de datos en la misma transaccion */
+    EXEC SQL SELECT MAX(severidad) INTO :severidad :ind_sev FROM alertas WHERE lectura_id = :id;
+    EXEC SQL COMMIT;
+    printf("Lectura %ld registrada: %s = %.2f  ->  %s\n", id, codigo, valor,
+           ind_sev < 0 ? "normal" : severidad);
+    return 0;
+}
+
+/* simular [segundos]: 9 lecturas por segundo con una sentencia preparada */
+#define MAX_SENSORES 32
+static int cmd_simular(int segundos)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+    char codigo[21], severidad[13];
+    double umbral, valor;
+    long id;
+    short ind_sev;
+    const char *sql_insert = "INSERT INTO lecturas (sensor_id, valor) "
+                             "SELECT id, ? FROM sensores WHERE codigo = ? RETURNING id";
+    EXEC SQL END DECLARE SECTION;
+    char codigos[MAX_SENSORES][21];
+    double umbrales[MAX_SENSORES];
+    int n = 0, ronda = 0;
+    long total = 0, alertas = 0;
+    time_t fin = time(NULL) + segundos;
+
+    /* 1. cargar la lista de sensores una sola vez */
+    EXEC SQL DECLARE cur_sim CURSOR FOR SELECT codigo, umbral_max FROM sensores ORDER BY id;
+    EXEC SQL OPEN cur_sim;
+    while (n < MAX_SENSORES) {
+        EXEC SQL FETCH cur_sim INTO :codigo, :umbral;
+        if (sqlca.sqlcode == ECPG_NOT_FOUND || sqlca.sqlcode < 0) break;
+        strcpy(codigos[n], codigo);
+        umbrales[n++] = umbral;
+    }
+    EXEC SQL CLOSE cur_sim;
+
+    /* 2. preparar la sentencia: el servidor la analiza una vez y se ejecuta muchas */
+    EXEC SQL PREPARE ins_lectura FROM :sql_insert;
+    if (fallo("preparar la sentencia")) return 1;
+    srand((unsigned) time(NULL));
+    printf("Simulando %d sensores%s...\n", n, segundos > 0 ? "" : " sin limite de tiempo");
+
+    while (segundos <= 0 || time(NULL) < fin) {
+        int alertas_ronda = 0;
+        ronda++;
+        for (int i = 0; i < n; i++) {
+            double r = (double) rand() / RAND_MAX;
+            valor = umbrales[i] * (0.76 + 0.08 * ((double) rand() / RAND_MAX));
+            if (r < 0.02)      valor = umbrales[i] * 1.10;   /* pico: advertencia */
+            else if (r < 0.03) valor = umbrales[i] * 1.30;   /* pico: critica */
+            strcpy(codigo, codigos[i]);
+            EXEC SQL EXECUTE ins_lectura INTO :id USING :valor, :codigo;
+            if (sqlca.sqlcode < 0) break;
+            EXEC SQL SELECT MAX(severidad) INTO :severidad :ind_sev FROM alertas WHERE lectura_id = :id;
+            if (ind_sev >= 0) {
+                printf("  [%s] %s = %.2f (umbral %.2f)\n", severidad, codigo, valor, umbrales[i]);
+                alertas_ronda++;
+            }
+            total++;
+        }
+        if (fallo("registrar la ronda")) return 1;
+        EXEC SQL COMMIT;                    /* una transaccion por ronda */
+        alertas += alertas_ronda;
+        if (ronda % 10 == 0)
+            printf("Ronda %d: %ld lecturas registradas, %ld alertas\n", ronda, total, alertas);
+        fflush(stdout);
+        sleep(1);
+    }
+    EXEC SQL DEALLOCATE PREPARE ins_lectura;
+    printf("Fin de la simulacion: %ld lecturas, %ld alertas\n", total, alertas);
+    return 0;
+}
+
+/* ================================================================== */
+/* U · ACTUALIZAR                                                     */
+/* ================================================================== */
+
+/* umbral <sensor> <nuevo>: actualiza el umbral mostrando el valor anterior */
+static int cmd_umbral(const char *cod, double nuevo)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+    char codigo[21];
+    double umbral, anterior;
+    EXEC SQL END DECLARE SECTION;
+
+    snprintf(codigo, sizeof codigo, "%s", cod);
+    umbral = nuevo;
+    EXEC SQL SELECT umbral_max INTO :anterior FROM sensores WHERE codigo = :codigo FOR UPDATE;
+    if (fallo("leer el umbral")) return 1;
+    if (sqlca.sqlcode == ECPG_NOT_FOUND) {
+        printf("El sensor %s no existe.\n", codigo);
+        EXEC SQL ROLLBACK;
+        return 1;
+    }
+    EXEC SQL UPDATE sensores SET umbral_max = :umbral WHERE codigo = :codigo;
+    if (fallo("actualizar el umbral")) return 1;
+    long filas = sqlca.sqlerrd[2];          /* leer antes del COMMIT, que reinicia sqlca */
+    EXEC SQL COMMIT;
+    printf("Umbral de %s actualizado: %.2f -> %.2f (%ld fila)\n",
+           codigo, anterior, umbral, filas);
+    return 0;
+}
+
+/* estado <dispositivo> <activo|mantenimiento|inactivo> */
+static int cmd_estado(const char *cod, const char *nuevo)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+    char codigo[21], estado[16];
+    EXEC SQL END DECLARE SECTION;
+
+    snprintf(codigo, sizeof codigo, "%s", cod);
+    snprintf(estado, sizeof estado, "%s", nuevo);
+    EXEC SQL UPDATE dispositivos SET estado = :estado WHERE codigo = :codigo;
+    if (fallo("cambiar el estado")) return 1;
+    if (sqlca.sqlerrd[2] == 0) {            /* filas afectadas */
+        printf("El dispositivo %s no existe.\n", codigo);
+        EXEC SQL ROLLBACK;
+        return 1;
+    }
+    EXEC SQL COMMIT;
+    printf("Dispositivo %s ahora esta en %s.\n", codigo, estado);
+    return 0;
+}
+
+/* ================================================================== */
+/* D · ELIMINAR                                                       */
+/* ================================================================== */
+
+/* eliminar-lectura <id>: sus alertas se borran en cascada */
+static int cmd_eliminar_lectura(long lid)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+    long id;
+    EXEC SQL END DECLARE SECTION;
+
+    id = lid;
+    EXEC SQL DELETE FROM lecturas WHERE id = :id;
+    if (fallo("eliminar la lectura")) return 1;
+    if (sqlca.sqlerrd[2] == 0) {
+        printf("La lectura %ld no existe.\n", id);
+        EXEC SQL ROLLBACK;
+        return 1;
+    }
+    EXEC SQL COMMIT;
+    printf("Lectura %ld eliminada.\n", id);
+    return 0;
+}
+
+/* eliminar-sensor <codigo> [--con-lecturas]
+ * Sin la opcion, PostgreSQL rechaza el borrado si el sensor tiene lecturas (23503).
+ * Con la opcion, borra alertas, lecturas y sensor en UNA transaccion: todo o nada. */
+static int cmd_eliminar_sensor(const char *cod, int con_lecturas)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+    char codigo[21];
+    long n_alertas = 0, n_lecturas = 0;
+    EXEC SQL END DECLARE SECTION;
+
+    snprintf(codigo, sizeof codigo, "%s", cod);
+    if (con_lecturas) {
+        EXEC SQL DELETE FROM alertas WHERE sensor_id = (SELECT id FROM sensores WHERE codigo = :codigo);
+        n_alertas = sqlca.sqlerrd[2];
+        EXEC SQL DELETE FROM lecturas WHERE sensor_id = (SELECT id FROM sensores WHERE codigo = :codigo);
+        n_lecturas = sqlca.sqlerrd[2];
+    }
+    EXEC SQL DELETE FROM sensores WHERE codigo = :codigo;
+    if (fallo("eliminar el sensor")) {
+        if (!con_lecturas)
+            fprintf(stderr, "Usa: eliminar-sensor %s --con-lecturas\n", codigo);
+        return 1;
+    }
+    if (sqlca.sqlerrd[2] == 0) {
+        printf("El sensor %s no existe.\n", codigo);
+        EXEC SQL ROLLBACK;
+        return 1;
+    }
+    EXEC SQL COMMIT;
+    printf("Sensor %s eliminado (%ld lecturas y %ld alertas en la misma transaccion).\n",
+           codigo, n_lecturas, n_alertas);
+    return 0;
+}
+
+/* ================================================================== */
+/* Analisis de rendimiento                                            */
+/* ================================================================== */
+static double ahora_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1000.0 + t.tv_nsec / 1e6;
+}
+
+/* benchmark [n]: inserta n lecturas normales de tres formas y las borra al final */
+static int cmd_benchmark(int n)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+    char sql[256];
+    double valor;
+    long desde;
+    const char *sql_prep = "INSERT INTO lecturas (sensor_id, valor) "
+                           "SELECT id, ? FROM sensores WHERE codigo = 'PRE03-VIB'";
+    EXEC SQL END DECLARE SECTION;
+    double t0, t1, t2, t3;
+
+    if (n <= 0) n = 1000;
+    EXEC SQL SELECT COALESCE(MAX(id), 0) INTO :desde FROM lecturas;
+    EXEC SQL COMMIT;
+    printf("Insertando %d lecturas de PRE03-VIB de tres formas...\n\n", n);
+
+    /* A. SQL dinamico (texto armado con sprintf) y COMMIT por fila */
+    t0 = ahora_ms();
+    for (int i = 0; i < n; i++) {
+        snprintf(sql, sizeof sql, "INSERT INTO lecturas (sensor_id, valor) "
+                 "SELECT id, %.2f FROM sensores WHERE codigo = 'PRE03-VIB'", 5.0 + (i % 10) * 0.1);
+        EXEC SQL EXECUTE IMMEDIATE :sql;
+        EXEC SQL COMMIT;
+    }
+    t1 = ahora_ms();
+
+    /* B. Sentencia preparada y COMMIT por fila */
+    EXEC SQL PREPARE ins_bench FROM :sql_prep;
+    for (int i = 0; i < n; i++) {
+        valor = 5.0 + (i % 10) * 0.1;
+        EXEC SQL EXECUTE ins_bench USING :valor;
+        EXEC SQL COMMIT;
+    }
+    t2 = ahora_ms();
+
+    /* C. Sentencia preparada y UNA sola transaccion */
+    for (int i = 0; i < n; i++) {
+        valor = 5.0 + (i % 10) * 0.1;
+        EXEC SQL EXECUTE ins_bench USING :valor;
+    }
+    EXEC SQL COMMIT;
+    t3 = ahora_ms();
+    EXEC SQL DEALLOCATE PREPARE ins_bench;
+    if (fallo("ejecutar la prueba")) return 1;
+
+    printf("%-48s %10s %12s\n", "FORMA", "TOTAL", "POR LECTURA");
+    printf("%-48s %8.1f ms %9.3f ms\n", "A. SQL dinamico + COMMIT por fila", t1 - t0, (t1 - t0) / n);
+    printf("%-48s %8.1f ms %9.3f ms\n", "B. Sentencia preparada + COMMIT por fila", t2 - t1, (t2 - t1) / n);
+    printf("%-48s %8.1f ms %9.3f ms\n", "C. Sentencia preparada + una transaccion", t3 - t2, (t3 - t2) / n);
+    printf("\nC fue %.1f veces mas rapida que A.\n", (t1 - t0) / (t3 - t2));
+
+    EXEC SQL DELETE FROM lecturas WHERE id > :desde
+             AND sensor_id = (SELECT id FROM sensores WHERE codigo = 'PRE03-VIB');
+    printf("Limpieza: %ld lecturas de prueba eliminadas.\n", sqlca.sqlerrd[2]);
+    EXEC SQL COMMIT;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+static void ayuda(void)
+{
+    puts("Uso: iot_crud <comando> [argumentos]\n\n"
+         "  CREAR\n"
+         "    crear-sensor <codigo> <dispositivo> <tipo> <unidad> <umbral>\n"
+         "    registrar <sensor> <valor>\n"
+         "    simular [segundos]            (0 = sin limite)\n"
+         "  LEER\n"
+         "    listar\n"
+         "    sensor <codigo>\n"
+         "    lecturas <sensor> [cantidad]\n"
+         "    resumen\n"
+         "    monitor [segundos]\n"
+         "  ACTUALIZAR\n"
+         "    umbral <sensor> <nuevo>\n"
+         "    estado <dispositivo> <activo|mantenimiento|inactivo>\n"
+         "  ELIMINAR\n"
+         "    eliminar-lectura <id>\n"
+         "    eliminar-sensor <codigo> [--con-lecturas]\n"
+         "  RENDIMIENTO\n"
+         "    benchmark [cantidad]");
+}
+
+int main(int argc, char **argv)
+{
+    int rc;
+    const char *c = argc > 1 ? argv[1] : "ayuda";
+
+    /* Sin terminal (docker exec, logs) stdout usa un bufer y se mezcla en desorden con
+       stderr; con bufer por linea, cada mensaje sale en el orden en que se imprime */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
+    if (strcmp(c, "ayuda") == 0 || strcmp(c, "--help") == 0) { ayuda(); return 0; }
+    if (conectar() != 0) return 2;
+
+    if      (!strcmp(c, "listar"))                         rc = cmd_listar();
+    else if (!strcmp(c, "sensor") && argc > 2)             rc = cmd_sensor(argv[2]);
+    else if (!strcmp(c, "lecturas") && argc > 2)           rc = cmd_lecturas(argv[2], argc > 3 ? atoi(argv[3]) : 10);
+    else if (!strcmp(c, "resumen"))                        rc = cmd_resumen();
+    else if (!strcmp(c, "monitor"))                        rc = cmd_monitor(argc > 2 ? atoi(argv[2]) : 30);
+    else if (!strcmp(c, "crear-sensor") && argc > 6)       rc = cmd_crear_sensor(argv + 2);
+    else if (!strcmp(c, "registrar") && argc > 3)          rc = cmd_registrar(argv[2], atof(argv[3]));
+    else if (!strcmp(c, "simular"))                        rc = cmd_simular(argc > 2 ? atoi(argv[2]) : 60);
+    else if (!strcmp(c, "umbral") && argc > 3)             rc = cmd_umbral(argv[2], atof(argv[3]));
+    else if (!strcmp(c, "estado") && argc > 3)             rc = cmd_estado(argv[2], argv[3]);
+    else if (!strcmp(c, "eliminar-lectura") && argc > 2)   rc = cmd_eliminar_lectura(atol(argv[2]));
+    else if (!strcmp(c, "eliminar-sensor") && argc > 2)    rc = cmd_eliminar_sensor(argv[2],
+                                                               argc > 3 && !strcmp(argv[3], "--con-lecturas"));
+    else if (!strcmp(c, "benchmark"))                      rc = cmd_benchmark(argc > 2 ? atoi(argv[2]) : 1000);
+    else { ayuda(); rc = 1; }
+
+    EXEC SQL DISCONNECT iot;
+    return rc ? 1 : 0;
+}

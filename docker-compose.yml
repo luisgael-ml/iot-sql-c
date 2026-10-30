@@ -1,0 +1,48 @@
+# Tarea 10 · SQL embebido con C · IoT Analytics Dashboard (NexoDev Solutions)
+name: iot-sql-c
+
+services:
+  # ================= BASE DE DATOS =================
+  datos:
+    image: postgres:16
+    container_name: sqlc-datos
+    environment:
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-admin123}
+      POSTGRES_DB: iotanalytics
+    command: >
+      -c ssl=on -c ssl_cert_file=/etc/ssl/certs/ssl-cert-snakeoil.pem
+      -c ssl_key_file=/etc/ssl/private/ssl-cert-snakeoil.key
+    volumes:
+      - ./datos/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks: [red-datos]          # sin puerto expuesto a la PC
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d iotanalytics"]
+      interval: 3s
+      retries: 30
+
+  # ========= CLIENTE EN C: se usa con "docker exec sqlc-cliente iot_crud ..." =========
+  cliente:
+    build: ./cliente
+    container_name: sqlc-cliente
+    environment: &conexion
+      DB_HOST: datos
+      DB_USER: app_iot
+      DB_PASSWORD: app123
+      DB_SSLMODE: require
+      PGTZ: America/Mexico_City   # horas en la zona horaria local
+    networks: [red-datos]
+    depends_on:
+      datos: { condition: service_healthy }
+
+  # ========= SIMULADOR: el mismo programa en C enviando lecturas en tiempo real =========
+  simulador:
+    build: ./cliente
+    container_name: sqlc-simulador
+    command: ["iot_crud", "simular", "0"]
+    environment: *conexion
+    networks: [red-datos]
+    depends_on:
+      datos: { condition: service_healthy }
+
+networks:
+  red-datos:

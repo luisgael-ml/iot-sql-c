@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+
+# Archivos generados por ecpg y gcc
+cliente/iot_crud
+cliente/iot_crud.c
